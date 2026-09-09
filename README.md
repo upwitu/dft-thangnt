@@ -1,18 +1,39 @@
 # dft-thangnt
 
-Direct Fine-Tuning (DFT) — preference alignment for causal LLMs using
-[Unsloth](https://github.com/unslothai/unsloth) + [TRL](https://github.com/huggingface/trl).
+Dynamic Fine-Tuning (DFT) — a standalone, runnable implementation of
+[arXiv:2508.05629](https://arxiv.org/abs/2508.05629), *"On the Generalization of
+SFT: A Reinforcement Learning Perspective with Reward Rectification"*
+(Wu et al., ICLR 2026), built on [Unsloth](https://github.com/unslothai/unsloth)
+and [TRL](https://github.com/huggingface/trl).
 
-Three objectives are supported:
+## What DFT is
 
-| Method  | Trainer                        | Reference model | Notes |
-| ------- | ------------------------------ | --------------- | ----- |
-| `simpo` | `CPOTrainer(loss_type="simpo")` | not needed      | Length-normalized, target reward margin `gamma`. Default. |
-| `orpo`  | `ORPOTrainer`                  | not needed      | Combined SFT + odds-ratio loss, good when starting from a base model. |
-| `dpo`   | `DPOTrainer`                   | needed          | Classic DPO; uses the PEFT adapter-disabled path as its reference. |
+Read as a policy gradient, standard SFT implicitly assigns each token a reward
+of `1 / p_theta(token)`. Rare tokens therefore dominate the update, which the
+paper identifies as a cause of SFT's weak generalization relative to RL.
 
-Training runs QLoRA by default (4-bit base + LoRA adapters), so a 4B model
-aligns comfortably in well under 24 GB of VRAM.
+DFT rectifies this by rescaling each token's cross-entropy by the model's own
+**detached** probability of that token, cancelling the inverse-probability
+weighting and leaving a uniform reward of 1 across the expert trajectory —
+equation (9) of the paper:
+
+```
+L_DFT = E -sum_t  sg(p_theta(y*_t | y*_<t, x)) * log p_theta(y*_t | y*_<t, x)
+```
+
+In code that is one line on top of the usual per-token cross-entropy
+([dft_loss.py](dft_loss.py)):
+
+```python
+token_loss = F.cross_entropy(logits, labels, reduction="none", ignore_index=-100)
+with torch.no_grad():
+    coefficients = F.softmax(logits, dim=-1).gather(-1, labels).squeeze(-1)
+loss = masked_token_mean(token_loss * coefficients, labels)
+```
+
+DFT trains on **positive demonstrations only** — no preference pairs, no reward
+model, no teacher. It is a drop-in replacement for SFT, not a preference-alignment
+method.
 
 ## Setup
 
@@ -25,11 +46,7 @@ cd dft-thangnt
 uv sync
 ```
 
-`uv sync` creates `.venv/` from the exact pins in `uv.lock`, pulling
-`torch`/`xformers`/`triton` from PyTorch's cu124 index and everything else from
-PyPI. No conda environment and no manual CUDA setup needed.
-
-To verify the install end to end:
+Verify the install end to end:
 
 ```bash
 uv run python train_dft.py --model-path Qwen/Qwen2.5-1.5B-Instruct --smoke-test
@@ -42,128 +59,127 @@ to `outputs/`.
 
 ```bash
 uv run python train_dft.py \
-    --model-path /path/to/your/base-model \
-    --dataset /path/to/your/preference_pairs.jsonl \
+    --model-path /path/to/base-model \
+    --dataset /path/to/your_demonstrations.jsonl \
     --output-dir outputs/my-run \
-    --method simpo \
     --num-train-epochs 2
 ```
 
-Or through the wrapper, which tees a numbered log into `logs/`:
+To train the SFT baseline the paper compares against, with everything else held
+fixed:
 
 ```bash
-./train_dft.sh --model-path Qwen/Qwen2.5-3B-Instruct --dataset data/mine.jsonl
+uv run python train_dft.py --model-path ... --dataset ... --method sft
 ```
 
 ### Dataset format
 
-A JSONL file, one preference pair per line. Every row needs `prompt`, `chosen`
-and `rejected`; any other key (such as `category` below) is ignored and is free
-for your own bookkeeping.
+A JSONL file of positive demonstrations, one per line, in either of two shapes.
+Every row in a file must use the same shape — a mixed file is rejected, because
+prompt masking would otherwise apply to only part of the data.
+
+**Prompt + completion** — loss covers the completion only:
 
 ```json
 {
-  "category": "refuse_missing_capability",
-  "prompt": [
-    {"role": "system", "content": "# Assistant Policy\n- set_air_conditioning is NOT available."},
-    {"role": "user", "content": "turn on the air conditioning"}
-  ],
-  "chosen":   [{"role": "assistant", "content": "I'm sorry, air conditioning control isn't available here."}],
-  "rejected": [{"role": "assistant", "content": "Got it! Turning it on right away."}]
+  "prompt": [{"role": "user", "content": "What does DFT stand for?"}],
+  "completion": [{"role": "assistant", "content": "Dynamic Fine-Tuning."}]
 }
 ```
 
-**`prompt`** is either a list of chat messages — rendered with the model's own
-chat template, so multi-turn context and prior `tool` results work — or a plain
-pre-rendered string, used verbatim.
-
-**`chosen` / `rejected`** are each a single assistant turn, given as a one-element
-message list, a bare message object, or a plain string. A message may carry
-`content`, `tool_calls`, or both; tool calls are rendered into the
-`<tool_call>{"name": ..., "arguments": ...}</tool_call>` form that Qwen-style
-models emit:
+**Messages** — a full conversation; loss covers every assistant turn:
 
 ```json
 {
-  "prompt": [{"role": "user", "content": "set it to 21 degrees up front"}],
-  "chosen":   [{"role": "assistant", "content": "", "tool_calls": [
-      {"id": "call_1", "type": "function",
-       "function": {"name": "set_temperature", "arguments": {"zone": "front", "celsius": 21}}}]}],
-  "rejected": [{"role": "assistant", "content": "Sure, I've set it to 21."}]
+  "messages": [
+    {"role": "system", "content": "You are a terse assistant."},
+    {"role": "user", "content": "What does DFT stand for?"},
+    {"role": "assistant", "content": "Dynamic Fine-Tuning."}
+  ]
 }
 ```
 
-The shortest possible form is plain strings:
+Both are applied through the model's own chat template. See
+[`data/sample_sft_dataset.jsonl`](data/sample_sft_dataset.jsonl) for a working
+example.
 
-```json
-{"prompt": [{"role": "user", "content": "Which objective is reference-free?"}],
- "chosen": "Both SimPO and ORPO are.", "rejected": "All three are."}
+## Verifying a run
+
+**The DFT training loss can never exceed 1/e ≈ 0.3679.** Each token contributes
+`-p*log(p)`, which peaks at `p = 1/e`. The script checks this after training and
+warns if the bound is broken.
+
+A loss above 1/e does not mean the model is bad — it means the loss reduction or
+the gradient-accumulation scaling is wrong. The usual cause is
+`model_accepts_loss_kwargs`: Transformers skips its own
+`loss / gradient_accumulation_steps` whenever it believes the loss was instead
+normalized by the global token count, which it infers from that flag — true for
+any model whose `forward` takes `**kwargs`, i.e. every causal LM. Accelerate
+cannot compensate, because `Trainer` builds it with `num_steps=1`. Left
+unhandled, accumulated micro-batch losses are summed and never averaged, so both
+the gradient and the logged loss come out `gradient_accumulation_steps` times too
+large. [train_dft.py](train_dft.py) sets the flag `False` on the trainer.
+
+Evaluation reports the **plain unweighted LM loss**, not the DFT objective, so
+`eval_loss` stays directly comparable between a `--method dft` run and a
+`--method sft` one. Pass `--eval-dataset` to enable it.
+
+Run the loss unit tests, which check `dft_loss` against an independent loop-based
+evaluation of equation (9), the 1/e bound, the stop-gradient, and the shift
+alignment:
+
+```bash
+uv sync --group dev
+uv run pytest tests/ -q
 ```
-
-See [`data/sample_preference_dataset.jsonl`](data/sample_preference_dataset.jsonl)
-for 12 rows covering all of these shapes.
 
 ## Options
 
 ```
---method {simpo,orpo,dpo}   Alignment objective (default: simpo)
+--method {dft,sft}          dft applies the reweighted objective (default);
+                            sft is the baseline, everything else held fixed
 --model-path PATH           HF hub id or local directory (required)
---dataset PATH              Preference JSONL (default: bundled sample)
---output-dir DIR            Adapter + merged model destination (default: outputs)
+--dataset PATH              Demonstration JSONL (default: bundled sample)
+--eval-dataset PATH         Optional held-out JSONL; eval reports plain LM loss
+--output-dir DIR            Adapter destination (default: outputs)
 
 --lora-r INT                LoRA rank (default: 32)
 --lora-alpha INT            LoRA alpha (default: 64)
 --lora-dropout FLOAT        LoRA dropout (default: 0.0)
 
---learning-rate FLOAT       Default 5e-6 (SimPO/DPO) or 8e-6 (ORPO)
---num-train-epochs FLOAT    Train for N epochs (default: 2)
---max-steps INT             Train for exactly N optimizer steps
---batch-size INT            Per-device batch (default: 2, or 1 for DPO)
---grad-accum INT            Gradient accumulation (default: 4, or 8 for DPO)
---warmup-ratio FLOAT        LR warmup ratio (default: 0.1)
---beta FLOAT                Preference loss beta (default: 0.1)
---simpo-gamma FLOAT         SimPO reward margin (default: 0.5)
-
---max-seq-length INT        Total sequence cap (default: 4096)
---max-prompt-length INT     Prompt cap (default: 2048)
+--learning-rate FLOAT       Learning rate (default: 1e-4)
+--num-train-epochs FLOAT    Epochs (default: 2)
+--max-steps INT             Train for exactly N optimizer steps instead
+--batch-size INT            Per-device batch (default: 2)
+--grad-accum INT            Gradient accumulation (default: 8)
+--warmup-ratio FLOAT        LR warmup ratio (default: 0.03)
+--weight-decay FLOAT        Weight decay (default: 0.01)
+--max-grad-norm FLOAT       Gradient clipping (default: 1.0)
+--max-length INT            Max sequence length (default: 2048)
 
 --no-load-in-4bit           Load base in bf16/fp16 instead of 4-bit QLoRA
---eos-token STR             Override the turn-terminating token
---seed INT                  Random seed (default: 3407)
---no-merge                  Save only the adapter, skip the merged 16-bit model
---smoke-test                3 steps on up to 32 examples, to check the pipeline
+--seed INT                  Random seed (default: 42)
+--merge                     Also save a merged 16-bit model
+--smoke-test                3 steps on up to 32 rows, to check the pipeline
 ```
 
-### Choosing the EOS token
+## Memory note
 
-ChatML-derived models (Qwen, Yi, …) end an assistant turn with `<|im_end|>`
-rather than the tokenizer's nominal `eos_token`. The script detects this by
-looking for `<|im_end|>` in the model's chat template and falls back to
-`tokenizer.eos_token` otherwise. Pass `--eos-token` if your model uses something
-else — getting this wrong is the usual cause of a model that never stops
-generating.
+During a DFT training step the script withholds `labels` from the forward pass so
+the model does not also compute its own LM loss. That would upcast the
+`[batch, sequence, vocabulary]` logits to fp32 a second time; on a 248k-token
+vocabulary at length 8192 the duplicate is ~7.6 GB, enough on its own to push a 4B
+model off a 40 GB card. Evaluation passes `labels` through normally, since it
+wants exactly that plain LM loss.
 
-## Outputs
+## Provenance
 
-```
-outputs/
-├── dft_lora_adapter/    LoRA adapter + tokenizer (small, resumable)
-└── dft_merged_model/    Base + adapter merged to 16-bit, ready for vLLM
-```
+The loss in [dft_loss.py](dft_loss.py) is ported from the reference
+implementation in `kd-baselines` (`src/kd_baselines/losses.py`), where DFT runs as
+a teacher-free distillation method. This repository extracts it into a standalone
+trainer that runs on any base model and any demonstration data.
 
-Pass `--no-merge` to skip the merged copy when you are short on disk.
-
-## Notes
-
-- The script forces single-GPU training: it clears any inherited `WORLD_SIZE`,
-  `RANK` and related DDP variables, then pins `cuda:0`. Select a physical GPU
-  with `CUDA_VISIBLE_DEVICES`.
-- A few compatibility shims at the top disable the `torchao` integration and
-  stub the sub-byte `torch.intN` dtypes, which some torch builds lack. They must
-  run before `unsloth` is imported, which is why the imports are ordered the way
-  they are.
-- `save_strategy="no"` — only the final adapter is written. Set it in
-  `train_dft.py` if you want intermediate checkpoints.
+Paper authors' own code: https://github.com/yongliang-wu/DFT
 
 ## License
 
