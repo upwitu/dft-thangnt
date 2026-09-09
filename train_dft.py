@@ -68,7 +68,7 @@ except Exception:
 from datasets import Dataset  # noqa: E402
 from trl import SFTConfig, SFTTrainer  # noqa: E402
 
-from dft_loss import MAX_DFT_LOSS, dft_loss  # noqa: E402
+from dft_loss import IGNORE_INDEX, MAX_DFT_LOSS, dft_loss  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATASET = os.path.join(REPO_ROOT, "data", "sample_sft_dataset.jsonl")
@@ -208,6 +208,48 @@ def load_jsonl(path: str) -> list:
     return rows
 
 
+def tokenize_conversation(messages: list, tokenizer, max_length: int) -> dict | None:
+    """Tokenize a messages row, training on assistant turns only.
+
+    TRL's own ``assistant_only_loss`` is unreachable here: Unsloth patches
+    SFTTrainer._prepare_dataset and it recognises only ``labels``, ``input_ids``,
+    ``prompt``+``completion`` or a text field -- a ``messages`` column falls
+    through to a "you must specify a formatting_func" error. So we emit
+    ``input_ids``/``labels`` directly, which is the branch Unsloth does accept.
+
+    Each turn is tokenized as the token-level delta between the template
+    rendered up to and including it and the template rendered without it, so
+    role headers and separators land in the right span without any
+    template-specific string parsing. Returns None if the row has no assistant
+    content left after truncation.
+    """
+    input_ids: list[int] = []
+    labels: list[int] = []
+    previous: list[int] = []
+
+    for index, message in enumerate(messages):
+        upto = tokenizer.apply_chat_template(messages[:index + 1], tokenize=True)
+        if upto[:len(previous)] != previous:
+            raise ValueError(
+                "This model's chat template does not grow monotonically as turns "
+                "are added, so assistant spans cannot be located reliably. "
+                "Convert your data to the prompt+completion format instead."
+            )
+        segment = upto[len(previous):]
+        input_ids.extend(segment)
+        # The assistant's own tokens are supervised; role headers preceding a
+        # non-assistant turn, and every prompt token, are not.
+        labels.extend(segment if message.get("role") == "assistant"
+                      else [IGNORE_INDEX] * len(segment))
+        previous = upto
+
+    input_ids, labels = input_ids[:max_length], labels[:max_length]
+    if all(label == IGNORE_INDEX for label in labels):
+        return None
+    return {"input_ids": input_ids, "labels": labels,
+            "attention_mask": [1] * len(input_ids)}
+
+
 def main() -> None:
     args = build_parser().parse_args()
 
@@ -268,8 +310,28 @@ def main() -> None:
         random_state=args.seed,
     )
 
-    train_dataset = Dataset.from_list(rows)
-    eval_dataset = Dataset.from_list(eval_rows) if eval_rows else None
+    def to_dataset(source: list, label: str) -> Dataset:
+        if not conversational:
+            return Dataset.from_list(source)
+        tokenized, dropped = [], 0
+        for row in source:
+            encoded = tokenize_conversation(row["messages"], tokenizer, args.max_length)
+            if encoded is None:
+                dropped += 1
+            else:
+                tokenized.append(encoded)
+        if not tokenized:
+            raise ValueError(
+                f"Every {label} row lost all of its assistant tokens. Either no row "
+                "has an assistant turn, or --max-length truncates them all away."
+            )
+        if dropped:
+            print(f"Dropped {dropped}/{len(source)} {label} rows with no assistant "
+                  f"tokens left after truncation to --max-length {args.max_length}.")
+        return Dataset.from_list(tokenized)
+
+    train_dataset = to_dataset(rows, "train")
+    eval_dataset = to_dataset(eval_rows, "eval") if eval_rows else None
     if args.smoke_test:
         train_dataset = train_dataset.select(range(min(32, len(train_dataset))))
 
@@ -295,10 +357,10 @@ def main() -> None:
         eval_strategy="epoch" if eval_dataset is not None else "no",
         report_to=[],
         seed=args.seed,
-        # Train on the response only. Which knob does that depends on the row
-        # format: prompt+completion rows mask by column, messages rows mask by
-        # the chat template's assistant spans.
-        **({"assistant_only_loss": True} if conversational else {"completion_only_loss": True}),
+        # Train on the response only. Messages rows arrive already tokenized
+        # with their prompt spans masked, so the flag applies to the
+        # prompt+completion path alone.
+        **({} if conversational else {"completion_only_loss": True}),
     )
 
     trainer = DFTTrainer(

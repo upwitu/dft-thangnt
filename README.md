@@ -103,6 +103,18 @@ Both are applied through the model's own chat template. See
 [`data/sample_sft_dataset.jsonl`](data/sample_sft_dataset.jsonl) for a working
 example.
 
+TRL's own `assistant_only_loss` is unreachable under Unsloth, whose patched
+`SFTTrainer._prepare_dataset` recognises only `labels`, `input_ids`,
+`prompt`+`completion` or a text field — a `messages` column otherwise fails with
+*"You must specify a `formatting_func`"*. So messages rows are tokenized up
+front into `input_ids`/`labels`, masking every non-assistant span. Each turn is
+located as the token-level delta between the template rendered up to and
+including it and the template rendered without it, which avoids any
+template-specific string parsing; a template that does not grow monotonically as
+turns are added is rejected with a message telling you to use prompt+completion
+instead. Rows left with no assistant tokens after truncation to `--max-length`
+are dropped, and the count is reported.
+
 ## Verifying a run
 
 **The DFT training loss can never exceed 1/e ≈ 0.3679.** Each token contributes
