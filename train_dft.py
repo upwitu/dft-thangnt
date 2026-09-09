@@ -151,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Load the base model in 4-bit (QLoRA). Default on.")
     p.add_argument("--no-load-in-4bit", dest="load_in_4bit", action="store_false",
                    help="Load the base model in bf16/fp16 instead of 4-bit.")
+    p.add_argument("--no-think", dest="no_think", action="store_true", default=True,
+                   help="Messages rows: never supervise a <think> block. Default on. "
+                        "No effect on models without those tokens.")
+    p.add_argument("--think", dest="no_think", action="store_false",
+                   help="Supervise <think> blocks too, so the model learns to emit them.")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
     p.add_argument("--logging-steps", type=int, default=10, help="Log every N steps.")
 
@@ -208,7 +213,33 @@ def load_jsonl(path: str) -> list:
     return rows
 
 
-def tokenize_conversation(messages: list, tokenizer, max_length: int) -> dict | None:
+def find_think_span(segment: list, open_id: int, close_id: int) -> tuple[int, int] | None:
+    """Locate a <think>...</think> block inside one rendered turn.
+
+    Returns [start, end) over ``segment``, or None if the turn has no block.
+    """
+    try:
+        start = segment.index(open_id)
+        end = segment.index(close_id, start)
+    except ValueError:
+        return None
+    return start, end + 1
+
+
+def think_token_ids(tokenizer) -> tuple[int, int] | None:
+    """The ids of <think> and </think>, or None if this model has no such tokens."""
+    unknown = getattr(tokenizer, "unk_token_id", None)
+    ids = []
+    for token in ("<think>", "</think>"):
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or token_id == unknown:
+            return None
+        ids.append(token_id)
+    return ids[0], ids[1]
+
+
+def tokenize_conversation(messages: list, tokenizer, max_length: int,
+                          no_think: bool = True) -> dict | None:
     """Tokenize a messages row, training on assistant turns only.
 
     TRL's own ``assistant_only_loss`` is unreachable here: Unsloth patches
@@ -226,6 +257,7 @@ def tokenize_conversation(messages: list, tokenizer, max_length: int) -> dict | 
     input_ids: list[int] = []
     labels: list[int] = []
     previous: list[int] = []
+    think_ids = think_token_ids(tokenizer) if no_think else None
 
     for index, message in enumerate(messages):
         upto = tokenizer.apply_chat_template(messages[:index + 1], tokenize=True)
@@ -236,12 +268,26 @@ def tokenize_conversation(messages: list, tokenizer, max_length: int) -> dict | 
                 "Convert your data to the prompt+completion format instead."
             )
         segment = upto[len(previous):]
+        previous = upto
         input_ids.extend(segment)
+
         # The assistant's own tokens are supervised; role headers preceding a
         # non-assistant turn, and every prompt token, are not.
-        labels.extend(segment if message.get("role") == "assistant"
-                      else [IGNORE_INDEX] * len(segment))
-        previous = upto
+        if message.get("role") != "assistant":
+            labels.extend([IGNORE_INDEX] * len(segment))
+            continue
+
+        turn_labels = list(segment)
+        if think_ids is not None:
+            span = find_think_span(segment, *think_ids)
+            if span is not None:
+                start, end = span
+                # Also drop the separator that follows the block, so the
+                # supervised span begins at the answer itself.
+                if end < len(segment) and not tokenizer.decode([segment[end]]).strip():
+                    end += 1
+                turn_labels[start:end] = [IGNORE_INDEX] * (end - start)
+        labels.extend(turn_labels)
 
     input_ids, labels = input_ids[:max_length], labels[:max_length]
     if all(label == IGNORE_INDEX for label in labels):
@@ -315,7 +361,8 @@ def main() -> None:
             return Dataset.from_list(source)
         tokenized, dropped = [], 0
         for row in source:
-            encoded = tokenize_conversation(row["messages"], tokenizer, args.max_length)
+            encoded = tokenize_conversation(row["messages"], tokenizer,
+                                            args.max_length, no_think=args.no_think)
             if encoded is None:
                 dropped += 1
             else:

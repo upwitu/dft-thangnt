@@ -16,11 +16,20 @@ tokenize_conversation = train_dft.tokenize_conversation
 
 
 class FakeTokenizer:
-    """Minimal ChatML-like tokenizer: one token per word, plus role headers."""
+    """Minimal ChatML-like tokenizer: one token per word, plus role headers.
 
-    def __init__(self, monotonic: bool = True):
+    With thinking=True it mimics Qwen3, whose template unconditionally inserts
+    an empty <think> block in front of every assistant turn.
+    """
+
+    unk_token_id = 0
+
+    def __init__(self, monotonic: bool = True, thinking: bool = False):
         self.monotonic = monotonic
+        self.thinking = thinking
         self.vocab: dict[str, int] = {}
+        if thinking:  # reserve ids so the markers exist in the vocabulary
+            self._id("<think>"), self._id("</think>")
 
     def _id(self, piece: str) -> int:
         return self.vocab.setdefault(piece, len(self.vocab) + 1)
@@ -29,6 +38,8 @@ class FakeTokenizer:
         pieces = []
         for message in messages:
             pieces.append(f"<{message['role']}>")
+            if self.thinking and message["role"] == "assistant":
+                pieces += ["<think>", "\n\n", "</think>", "\n\n"]
             pieces.extend(message["content"].split())
             pieces.append("<end>")
         if not self.monotonic:
@@ -36,6 +47,13 @@ class FakeTokenizer:
             # system block that depends on later content.
             pieces = pieces[::-1]
         return [self._id(p) for p in pieces]
+
+    def convert_tokens_to_ids(self, token):
+        return self.vocab.get(token)
+
+    def decode(self, ids):
+        back = {v: k for k, v in self.vocab.items()}
+        return "".join(back[i] for i in ids)
 
     def decode_pieces(self, ids):
         back = {v: k for k, v in self.vocab.items()}
@@ -103,3 +121,54 @@ def test_non_monotonic_template_is_rejected():
     tok = FakeTokenizer(monotonic=False)
     with pytest.raises(ValueError, match="monotonically"):
         tokenize_conversation(CONVERSATION, tok, max_length=1000)
+
+
+# --- thinking blocks -------------------------------------------------------
+
+THINKING = [
+    {"role": "user", "content": "what is dft"},
+    {"role": "assistant", "content": "dynamic fine tuning"},
+]
+
+
+def test_no_think_masks_the_block_but_keeps_it_in_input_ids():
+    """The template always supplies the block, so it must stay in context."""
+    tok = FakeTokenizer(thinking=True)
+    out = tokenize_conversation(THINKING, tok, max_length=1000, no_think=True)
+
+    assert out["input_ids"] == tok.apply_chat_template(THINKING)
+    supervised = [i for i, label in zip(out["input_ids"], out["labels"])
+                  if label != IGNORE_INDEX]
+    assert tok.decode_pieces(supervised) == [
+        "<assistant>", "dynamic", "fine", "tuning", "<end>",
+    ]
+
+
+def test_think_flag_supervises_the_block():
+    tok = FakeTokenizer(thinking=True)
+    out = tokenize_conversation(THINKING, tok, max_length=1000, no_think=False)
+    supervised = [i for i, label in zip(out["input_ids"], out["labels"])
+                  if label != IGNORE_INDEX]
+    assert tok.decode_pieces(supervised) == [
+        "<assistant>", "<think>", "\n\n", "</think>", "\n\n",
+        "dynamic", "fine", "tuning", "<end>",
+    ]
+
+
+def test_no_think_is_a_no_op_without_think_tokens():
+    tok = FakeTokenizer(thinking=False)
+    with_flag = tokenize_conversation(CONVERSATION, tok, max_length=1000, no_think=True)
+    without = tokenize_conversation(CONVERSATION, tok, max_length=1000, no_think=False)
+    assert with_flag == without
+
+
+def test_no_think_row_with_only_a_think_block_is_dropped():
+    """An assistant turn whose entire content is thinking leaves nothing to learn."""
+    tok = FakeTokenizer(thinking=True)
+    rows = [{"role": "user", "content": "x"}, {"role": "assistant", "content": ""}]
+    out = tokenize_conversation(rows, tok, max_length=1000, no_think=True)
+    # The header and <end> still carry supervision, so the row survives; the
+    # block itself must not.
+    supervised = [i for i, label in zip(out["input_ids"], out["labels"])
+                  if label != IGNORE_INDEX]
+    assert "<think>" not in tok.decode_pieces(supervised)
