@@ -1,0 +1,51 @@
+[project]
+name = "dft-thangnt"
+version = "0.1.0"
+description = "Direct Fine-Tuning (SimPO / ORPO / DPO) for causal LLMs with Unsloth + TRL"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch==2.6.0",
+    "xformers==0.0.29.post2",
+    "triton==3.2.0",
+    "unsloth==2026.8.22",
+    "transformers==4.57.6",
+    "trl==0.24.0",
+    "peft==0.20.0",
+    "datasets==4.3.0",
+    "accelerate==1.14.0",
+    "bitsandbytes==0.50.1",
+    "sentencepiece>=0.2.0",
+    "protobuf>=4.25,<5",
+    "numpy>=2.0,<3",
+    "hf-transfer>=0.1.8",
+    # Triton imports setuptools at runtime when it builds its CUDA driver
+    # shim; uv venvs do not seed it the way conda/virtualenv do.
+    "setuptools>=70",
+]
+
+[project.scripts]
+train-dft = "train_dft:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+include = ["train_dft.py"]
+
+[tool.uv]
+# CUDA training repo: resolve for Linux only. Resolving universally drags in
+# unsloth-zoo's macOS-only mlx-lm dep, which requires transformers>=5.
+environments = ["sys_platform == 'linux'"]
+
+# torch/xformers/triton come from PyTorch's CUDA 12.4 index; everything else
+# resolves from PyPI. `explicit = true` keeps other packages off this index.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+xformers = { index = "pytorch-cu124" }

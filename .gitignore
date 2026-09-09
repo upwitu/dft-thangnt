@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Training artifacts
+outputs/
+*.log
+wandb/
+runs/
+
+# Model weights
+*.safetensors
+*.bin
+*.pt
+*.gguf
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Unsloth codegen cache
+unsloth_compiled_cache/
